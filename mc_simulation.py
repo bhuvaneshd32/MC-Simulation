@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
 """
-Monte Carlo Simulation for Barrier Options with Streamlit Interface (CUDA Version)
-
-This implementation provides:
-- Interactive Streamlit interface
-- GPU-accelerated computation with CuPy (CUDA)
-- Down-and-Out/Up-and-Out Barrier Options
-- Call/Put European Options
-- CPU/GPU utilization graphs
-- Convergence study with Price Convergence and Error Reduction plots
-- Performance Metrics and Visualization
+CUDA-Accelerated Monte Carlo Simulation for Barrier Options with Advanced Features
+and CPU Fallback
 """
 
-import streamlit as st
+import numpy as np
+import argparse
 import time
 import math
-import matplotlib.pyplot as plt
-import psutil
-import GPUtil
 from datetime import datetime
+import matplotlib.pyplot as plt
 from typing import Union, Tuple, Optional
 
+# Try to import CuPy; fall back to NumPy if not available
 try:
     import cupy as cp
-    CUDA_AVAILABLE = True
+    GPU_AVAILABLE = True
 except ImportError:
-    CUDA_AVAILABLE = False
-    st.error("CuPy not installed. CUDA acceleration unavailable. Please install CuPy (e.g., 'pip install cupy-cuda11x').")
-    raise SystemExit
+    cp = np
+    GPU_AVAILABLE = False
 
 class MonteCarloBarrierOption:
-    """
-    Monte Carlo Simulation for Barrier Options Pricing using CuPy (CUDA) with Streamlit integration.
-    """
-
     def __init__(self,
                  S0: float,
                  K: float,
@@ -46,73 +33,137 @@ class MonteCarloBarrierOption:
                  option_type: str = 'call',
                  barrier_type: str = 'down-and-out',
                  use_antithetic: bool = True,
-                 seed: Optional[int] = None):
-        if not CUDA_AVAILABLE:
-            raise RuntimeError("CUDA not available. Cannot proceed with GPU computation.")
-        
+                 seed: Optional[int] = None,
+                 device_id: int = 0,
+                 force_cpu: bool = False):
+        # Parameter validation
+        if not all(isinstance(x, (int, float)) and x > 0 for x in [S0, K, T, r, sigma, barrier]):
+            raise ValueError("All financial parameters must be positive numbers")
+        if not isinstance(steps, int) or steps <= 0:
+            raise ValueError("Steps must be a positive integer")
+        if not isinstance(paths, int) or paths <= 0:
+            raise ValueError("Paths must be a positive integer")
+        if option_type.lower() not in ['call', 'put']:
+            raise ValueError("Option type must be either 'call' or 'put'")
+        if barrier_type.lower() not in ['down-and-out', 'up-and-out', 'down-and-in', 'up-and-in']:
+            raise ValueError("Invalid barrier type")
+
+        # Financial parameters
         self.S0 = float(S0)
         self.K = float(K)
         self.T = float(T)
         self.r = float(r)
         self.sigma = float(sigma)
         self.barrier = float(barrier)
+
+        # Simulation parameters
         self.steps = int(steps)
         self.paths = int(paths)
         self.option_type = option_type.lower()
         self.barrier_type = barrier_type.lower()
         self.use_antithetic = bool(use_antithetic)
         self.seed = seed if seed is not None else int(time.time())
+        self.device_id = device_id
+        self.force_cpu = force_cpu
+
+        # Results storage
         self.option_price = None
         self.std_error = None
         self.simulation_time = None
         self.convergence_data = None
         self.paths_generated = 0
-        self.cpu_usage = []
-        self.gpu_usage = []
-        
-        # Initialize CUDA
-        cp.cuda.Device(0).use()
-        cp.random.seed(self.seed)
-        self.xp = cp  # Use CuPy for all array operations
 
-    def _monitor_resources(self):
-        """Monitor CPU and GPU usage"""
-        self.cpu_usage.append(psutil.cpu_percent(interval=0.1))
-        gpus = GPUtil.getGPUs()
-        self.gpu_usage.append(gpus[0].load * 100 if gpus else 0)
+        # Determine whether to use GPU or CPU
+        self.use_gpu = GPU_AVAILABLE and not force_cpu
+        self.xp = cp if self.use_gpu else np
 
-    def _generate_paths(self) -> cp.ndarray:
+        # GPU initialization if applicable
+        if self.use_gpu:
+            self._initialize_gpu()
+        else:
+            print("Using CPU (NumPy) for computation")
+
+        # Set random seed
+        self.xp.random.seed(self.seed)
+
+        # Print initialization message
+        self._print_init_message()
+
+    def _initialize_gpu(self) -> None:
+        try:
+            device_count = cp.cuda.runtime.getDeviceCount()
+            if self.device_id >= device_count:
+                raise ValueError(f"Device ID {self.device_id} not available. Only {device_count} GPU(s) detected.")
+            cp.cuda.Device(self.device_id).use()
+            print(f"Using GPU Device {self.device_id}: {cp.cuda.runtime.getDeviceProperties(self.device_id)['name'].decode()}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize GPU: {str(e)}")
+
+    def _print_init_message(self) -> None:
+        print("\n" + "="*80)
+        print("MONTE CARLO BARRIER OPTION PRICING (CUDA ACCELERATED)" if self.use_gpu else "MONTE CARLO BARRIER OPTION PRICING (CPU)")
+        print("="*80)
+        print(f"Initialization Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Random Seed: {self.seed}")
+        print("\nFinancial Parameters:")
+        print(f"  Initial Stock Price (S0): {self.S0:.2f}")
+        print(f"  Strike Price (K): {self.K:.2f}")
+        print(f"  Time to Maturity (T): {self.T:.2f} years")
+        print(f"  Risk-Free Rate (r): {self.r:.4f}")
+        print(f"  Volatility (σ): {self.sigma:.4f}")
+        print(f"  Barrier Level: {self.barrier:.2f}")
+        print("\nSimulation Parameters:")
+        print(f"  Option Type: {self.option_type}")
+        print(f"  Barrier Type: {self.barrier_type}")
+        print(f"  Time Steps: {self.steps}")
+        print(f"  Paths: {self.paths}")
+        print(f"  Antithetic Variates: {'Enabled' if self.use_antithetic else 'Disabled'}")
+        print("="*80 + "\n")
+
+    def _generate_paths(self) -> 'xp.ndarray':
         dt = self.T / self.steps
         drift = (self.r - 0.5 * self.sigma**2) * dt
-        volatility = self.sigma * cp.sqrt(dt)
+        volatility = self.sigma * math.sqrt(dt)
+
         actual_paths = self.paths // 2 if self.use_antithetic else self.paths
-        
-        Z = self.xp.random.standard_normal((actual_paths, self.steps))
-        S = self.xp.empty((actual_paths, self.steps))
+        # Handle dtype conditionally
+        if self.use_gpu:
+            Z = self.xp.random.standard_normal((actual_paths, self.steps), dtype=self.xp.float32)
+            S = self.xp.empty((actual_paths, self.steps), dtype=self.xp.float32)
+        else:
+            Z = self.xp.random.standard_normal((actual_paths, self.steps)).astype(np.float32)
+            S = self.xp.empty((actual_paths, self.steps), dtype=np.float32)
         S[:, 0] = self.S0
+
         for t in range(1, self.steps):
-            self._monitor_resources()
             S[:, t] = S[:, t-1] * self.xp.exp(drift + volatility * Z[:, t])
+
         if self.use_antithetic:
-            S_antithetic = self.xp.empty_like(S)
+            if self.use_gpu:
+                S_antithetic = self.xp.empty_like(S, dtype=self.xp.float32)
+            else:
+                S_antithetic = self.xp.empty_like(S, dtype=np.float32)
             S_antithetic[:, 0] = self.S0
             for t in range(1, self.steps):
-                self._monitor_resources()
                 S_antithetic[:, t] = S_antithetic[:, t-1] * self.xp.exp(drift - volatility * Z[:, t])
             S = self.xp.concatenate((S, S_antithetic), axis=0)
+
         self.paths_generated = S.shape[0]
         return S
 
-    def _check_barrier_condition(self, S: cp.ndarray) -> cp.ndarray:
+    def _check_barrier_condition(self, S: 'xp.ndarray') -> 'xp.ndarray':
         if 'down' in self.barrier_type:
             barrier_hit = self.xp.any(S <= self.barrier, axis=1)
         elif 'up' in self.barrier_type:
             barrier_hit = self.xp.any(S >= self.barrier, axis=1)
+        else:
+            raise ValueError("Invalid barrier type")
+
         if 'in' in self.barrier_type:
             barrier_hit = ~barrier_hit
         return barrier_hit
 
-    def _calculate_payoffs(self, S: cp.ndarray) -> cp.ndarray:
+    def _calculate_payoffs(self, S: 'xp.ndarray') -> 'xp.ndarray':
         final_prices = S[:, -1]
         if self.option_type == 'call':
             payoffs = self.xp.maximum(final_prices - self.K, 0)
@@ -120,17 +171,16 @@ class MonteCarloBarrierOption:
             payoffs = self.xp.maximum(self.K - final_prices, 0)
         return payoffs
 
-    def _compute_statistics(self, payoffs: cp.ndarray) -> Tuple[float, float]:
+    def _compute_statistics(self, payoffs: 'xp.ndarray') -> Tuple[float, float]:
         discount_factor = self.xp.exp(-self.r * self.T)
         discounted_payoffs = discount_factor * payoffs
-        option_price = self.xp.mean(discounted_payoffs).get()  # Transfer to CPU for final result
-        std_error = self.xp.std(discounted_payoffs).get() / self.xp.sqrt(len(payoffs)).get()
+        option_price = self.xp.mean(discounted_payoffs).item() if self.use_gpu else float(self.xp.mean(discounted_payoffs))
+        std_error = (self.xp.std(discounted_payoffs) / self.xp.sqrt(len(payoffs))).item() if self.use_gpu else float(self.xp.std(discounted_payoffs) / self.xp.sqrt(len(payoffs)))
         return option_price, std_error
 
     def simulate(self, batch_size: Optional[int] = None) -> float:
         start_time = time.time()
-        self.cpu_usage = []
-        self.gpu_usage = []
+
         if batch_size is None:
             S = self._generate_paths()
             barrier_hit = self._check_barrier_condition(S)
@@ -140,7 +190,6 @@ class MonteCarloBarrierOption:
         else:
             total_batches = math.ceil(self.paths / batch_size)
             batch_results = []
-            original_paths = self.paths
             for batch in range(total_batches):
                 current_paths = min(batch_size, self.paths - batch * batch_size)
                 self.paths = current_paths
@@ -150,154 +199,167 @@ class MonteCarloBarrierOption:
                 payoffs[barrier_hit] = 0.0
                 batch_price, _ = self._compute_statistics(payoffs)
                 batch_results.append(batch_price)
-            self.paths = original_paths
-            self.option_price = float(self.xp.mean(self.xp.array(batch_results)).get())
-            self.std_error = float(self.xp.std(self.xp.array(batch_results)).get() / self.xp.sqrt(total_batches).get())
+                print(f"Batch {batch+1}/{total_batches} complete - Current estimate: {batch_price:.4f}")
+            self.paths = batch_size * total_batches
+            self.option_price = np.mean(batch_results)
+            self.std_error = np.std(batch_results) / np.sqrt(total_batches)
+
         self.simulation_time = time.time() - start_time
+        self._print_results()
         return self.option_price
 
     def convergence_study(self, min_paths: int = 1000, max_paths: int = None,
-                         steps: int = 10, log_scale: bool = True) -> None:
+                          steps: int = 10, log_scale: bool = True) -> None:
         if max_paths is None:
             max_paths = self.paths
+
         if log_scale:
-            path_counts = self.xp.logspace(self.xp.log10(min_paths), self.xp.log10(max_paths), steps, dtype=self.xp.int32).get()
+            path_counts = np.logspace(np.log10(min_paths), np.log10(max_paths), steps, dtype=int)
         else:
-            path_counts = self.xp.linspace(min_paths, max_paths, steps, dtype=self.xp.int32).get()
+            path_counts = np.linspace(min_paths, max_paths, steps, dtype=int)
+
         prices = []
         errors = []
+
+        print("\nRunning Convergence Study...")
         original_paths = self.paths
+
         for count in path_counts:
             self.paths = count
             price = self.simulate()
             prices.append(price)
             errors.append(self.std_error)
+            print(f"Paths: {count:8d} | Price: {price:.4f} | Std Error: {self.std_error:.6f}")
+
         self.paths = original_paths
         self.convergence_data = (path_counts, prices, errors)
+        self.plot_convergence()
 
-    def plot_convergence(self):
-        """Plot convergence study results in Streamlit, matching the provided image style."""
+    def plot_convergence(self) -> None:
         if self.convergence_data is None:
-            st.error("No convergence data available. Run convergence_study() first.")
-            return
+            raise ValueError("No convergence data available. Run convergence_study() first.")
 
         path_counts, prices, errors = self.convergence_data
+        plt.figure(figsize=(12, 6))
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(path_counts, prices, 'b-o')
+        plt.xlabel('Number of Paths')
+        plt.ylabel('Option Price')
+        plt.title('Price Convergence')
+        plt.grid(True)
 
-        # Price convergence plot
-        ax1.plot(path_counts, prices, 'b-o')
-        ax1.set_xlabel('Number of Paths')
-        ax1.set_ylabel('Option Price')
-        ax1.set_title('Price Convergence')
-        ax1.grid(True)
-
-        # Error reduction plot
-        ax2.plot(path_counts, errors, 'r-o')
-        ax2.set_xlabel('Number of Paths')
-        ax2.set_ylabel('Standard Error')
-        ax2.set_title('Error Reduction')
-        ax2.grid(True)
+        plt.subplot(1, 2, 2)
+        plt.plot(path_counts, errors, 'r-o')
+        plt.xlabel('Number of Paths')
+        plt.ylabel('Standard Error')
+        plt.title('Error Reduction')
+        plt.grid(True)
 
         plt.tight_layout()
-        return fig
+        plt.show()
 
-    def plot_resources(self):
-        """Plot CPU and GPU utilization in Streamlit."""
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        time_points = [i * (self.simulation_time / len(self.cpu_usage)) for i in range(len(self.cpu_usage))]
-        ax1.plot(time_points, self.cpu_usage, 'b-', label='CPU Usage (%)')
-        ax1.set_xlabel('Time (s)')
-        ax1.set_ylabel('CPU Usage (%)')
-        ax1.set_title('CPU Utilization During Simulation')
-        ax1.grid(True)
-        ax1.legend()
-        ax2.plot(time_points, self.gpu_usage, 'g-', label='GPU Usage (%)')
-        ax2.set_xlabel('Time (s)')
-        ax2.set_ylabel('GPU Usage (%)')
-        ax2.set_title('GPU Utilization During Simulation')
-        ax2.grid(True)
-        ax2.legend()
-        plt.tight_layout()
-        return fig
+    def _print_results(self) -> None:
+        print("\n" + "="*80)
+        print("SIMULATION RESULTS")
+        print("="*80)
+        print(f"Option Type: {self.option_type.upper()} {self.barrier_type.upper().replace('-', ' ')}")
+        print(f"Final Price Estimate: {self.option_price:.4f}")
+        print(f"Standard Error: {self.std_error:.6f}")
+        print(f"95% Confidence Interval: [{self.option_price - 1.96*self.std_error:.4f}, {self.option_price + 1.96*self.std_error:.4f}]")
+        print(f"Paths Generated: {self.paths_generated:,}")
+        print(f"Simulation Time: {self.simulation_time:.4f} seconds")
+        print(f"Paths per Second: {self.paths_generated/self.simulation_time:,.0f}")
+        print("="*80 + "\n")
+
+    def __str__(self) -> str:
+        return (f"MonteCarloBarrierOption(S0={self.S0:.2f}, K={self.K:.2f}, T={self.T:.2f}, "
+                f"r={self.r:.4f}, σ={self.sigma:.4f}, barrier={self.barrier:.2f}, "
+                f"type={self.option_type}, barrier_type={self.barrier_type})")
+
+def run_interactive() -> None:
+    print("\n" + "="*80)
+    print("INTERACTIVE MONTE CARLO BARRIER OPTION PRICING")
+    print("="*80)
+
+    try:
+        S0 = float(input("Initial Stock Price (S0): "))
+        K = float(input("Strike Price (K): "))
+        T = float(input("Time to Maturity (years, T): "))
+        r = float(input("Risk-Free Rate (decimal, r): "))
+        sigma = float(input("Volatility (decimal, σ): "))
+        barrier = float(input("Barrier Level: "))
+        steps = int(input("Number of Time Steps: "))
+        paths = int(input("Number of Monte Carlo Paths: "))
+        option_type = input("Option Type (call/put): ").strip().lower()
+        barrier_type = input("Barrier Type (down-and-out/up-and-out/down-and-in/up-and-in): ").strip().lower()
+        use_antithetic = input("Use Antithetic Variates? (y/n): ").strip().lower() == 'y'
+        force_cpu = input("Force CPU usage? (y/n): ").strip().lower() == 'y'
+
+        mc_option = MonteCarloBarrierOption(
+            S0=S0, K=K, T=T, r=r, sigma=sigma, barrier=barrier,
+            steps=steps, paths=paths, option_type=option_type,
+            barrier_type=barrier_type, use_antithetic=use_antithetic,
+            force_cpu=force_cpu
+        )
+
+        run_convergence = input("Run Convergence Study? (y/n): ").strip().lower() == 'y'
+        if run_convergence:
+            mc_option.convergence_study()
+        else:
+            mc_option.simulate()
+
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        print("Please try again with valid inputs.\n")
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="CUDA Monte Carlo Barrier Option Pricing with Advanced Features",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('--S0', type=float, default=100.0, help="Initial stock price")
+    parser.add_argument('--K', type=float, default=100.0, help="Strike price")
+    parser.add_argument('--T', type=float, default=1.0, help="Time to maturity (years)")
+    parser.add_argument('--r', type=float, default=0.05, help="Risk-free interest rate")
+    parser.add_argument('--sigma', type=float, default=0.2, help="Volatility")
+    parser.add_argument('--barrier', type=float, default=90.0, help="Barrier level")
+    parser.add_argument('--steps', type=int, default=252, help="Number of time steps")
+    parser.add_argument('--paths', type=int, default=1000000, help="Number of Monte Carlo paths")
+    parser.add_argument('--option_type', type=str, choices=['call', 'put'], default='call', help="Option type")
+    parser.add_argument('--barrier_type', type=str,
+                        choices=['down-and-out', 'up-and-out', 'down-and-in', 'up-and-in'],
+                        default='down-and-out', help="Barrier type")
+    parser.add_argument('--no_antithetic', action='store_false', dest='use_antithetic',
+                        help="Disable antithetic variates")
+    parser.add_argument('--seed', type=int, default=None, help="Random seed")
+    parser.add_argument('--device', type=int, default=0, help="GPU device ID")
+    parser.add_argument('--batch_size', type=int, default=None, help="Run simulation in batches of this size")
+    parser.add_argument('--convergence', action='store_true', help="Run convergence study")
+    parser.add_argument('--force_cpu', action='store_true', help="Force CPU usage even if GPU is available")
+
+    return parser.parse_args()
 
 def main():
-    st.title("Monte Carlo Barrier Option Pricing (CUDA)")
-    st.markdown("""
-    This tool calculates barrier option prices using Monte Carlo simulation with CUDA (CuPy).
-    Adjust the parameters below and click 'Run Simulation' to see the results, convergence plots, and resource utilization.
-    """)
-
-    # Sidebar for input parameters
-    st.sidebar.header("Simulation Parameters")
-    S0 = st.sidebar.number_input("Initial Stock Price (S0)", min_value=1.0, value=100.0, step=1.0)
-    K = st.sidebar.number_input("Strike Price (K)", min_value=1.0, value=100.0, step=1.0)
-    T = st.sidebar.number_input("Time to Maturity (years)", min_value=0.1, value=1.0, step=0.1)
-    r = st.sidebar.number_input("Risk-Free Rate", min_value=0.0, value=0.05, step=0.01)
-    sigma = st.sidebar.number_input("Volatility (σ)", min_value=0.01, value=0.2, step=0.01)
-    barrier = st.sidebar.number_input("Barrier Level", min_value=1.0, value=90.0, step=1.0)
-    steps = st.sidebar.number_input("Time Steps", min_value=10, value=252, step=10)
-    paths = st.sidebar.number_input("Number of Paths", min_value=1000, value=100000, step=1000)
-    option_type = st.sidebar.selectbox("Option Type", ["call", "put"])
-    barrier_type = st.sidebar.selectbox("Barrier Type", ["down-and-out", "up-and-out", "down-and-in", "up-and-in"])
-    use_antithetic = st.sidebar.checkbox("Use Antithetic Variates", value=True)
-    run_convergence = st.sidebar.checkbox("Run Convergence Study", value=False)
-
-    # Display current parameters
-    st.sidebar.subheader("Current Parameters")
-    current_seed = int(time.time())
-    st.sidebar.write(f"Seed: {current_seed}")
-    st.sidebar.write(f"S0: {S0:.2f}")
-    st.sidebar.write(f"K: {K:.2f}")
-    st.sidebar.write(f"T: {T:.2f} years")
-    st.sidebar.write(f"r: {r:.4f}")
-    st.sidebar.write(f"σ: {sigma:.4f}")
-    st.sidebar.write(f"Barrier: {barrier:.2f}")
-    st.sidebar.write(f"Steps: {steps}")
-    st.sidebar.write(f"Paths: {paths:,}")
-    st.sidebar.write("Compute: GPU (CUDA via CuPy)")
-
-    if st.button("Run Simulation"):
-        with st.spinner("Running simulation on GPU..."):
-            try:
-                mc_option = MonteCarloBarrierOption(
-                    S0=S0,
-                    K=K,
-                    T=T,
-                    r=r,
-                    sigma=sigma,
-                    barrier=barrier,
-                    steps=steps,
-                    paths=paths,
-                    option_type=option_type,
-                    barrier_type=barrier_type,
-                    use_antithetic=use_antithetic,
-                    seed=current_seed
-                )
-
-                if run_convergence:
-                    mc_option.convergence_study()
-                    st.subheader("Convergence Study Results")
-                    fig = mc_option.plot_convergence()
-                    st.pyplot(fig)
-                else:
-                    price = mc_option.simulate()
-                    st.subheader("Simulation Results")
-                    st.write(f"**Option Type:** {option_type.upper()} {barrier_type.upper().replace('-', ' ')}")
-                    st.write(f"**Price Estimate:** {mc_option.option_price:.4f}")
-                    st.write(f"**Standard Error:** {mc_option.std_error:.6f}")
-                    st.write(f"**95% Confidence Interval:** [{mc_option.option_price - 1.96*mc_option.std_error:.4f}, {mc_option.option_price + 1.96*mc_option.std_error:.4f}]")
-                    st.write(f"**Paths Generated:** {mc_option.paths_generated:,}")
-                    st.write(f"**Simulation Time:** {mc_option.simulation_time:.4f} seconds")
-                    st.write(f"**Paths per Second:** {mc_option.paths_generated/mc_option.simulation_time:,.0f}")
-
-                # Resource utilization plots
-                st.subheader("Resource Utilization")
-                fig = mc_option.plot_resources()
-                st.pyplot(fig)
-
-            except Exception as e:
-                st.error(f"Simulation failed: {str(e)}")
+    try:
+        args = parse_arguments()
+        mc_option = MonteCarloBarrierOption(
+            S0=args.S0, K=args.K, T=args.T, r=args.r, sigma=args.sigma,
+            barrier=args.barrier, steps=args.steps, paths=args.paths,
+            option_type=args.option_type, barrier_type=args.barrier_type,
+            use_antithetic=args.use_antithetic, seed=args.seed,
+            device_id=args.device, force_cpu=args.force_cpu
+        )
+        if args.convergence:
+            mc_option.convergence_study()
+        else:
+            mc_option.simulate(batch_size=args.batch_size)
+    except Exception as e:
+        print(f"\nError: {str(e)}")
+        print("Use --help for usage information.\n")
 
 if __name__ == "__main__":
-    main()
+    try:
+        run_interactive()
+    except:
+        main()
